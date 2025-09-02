@@ -42,6 +42,7 @@ func init() {
 	nodeExecutors[backends.OpTypeSlice] = execSlice
 	nodeExecutors[backends.OpTypeArgMinMax] = execArgMinMax
 	nodeExecutors[backends.OpTypeReduceWindow] = execReduceWindow
+	nodeExecutors[backends.OpTypeConvGeneralDilated] = execConvGeneralDilated
 
 	// For nodes with multiple outputs:
 	multiOutputsNodeExecutors[backends.OpTypeRngBitGenerator] = execRngBitGenerator
@@ -1916,4 +1917,325 @@ func reduceWindowProductBuildUpdateFnBFloat16(operand, output *Buffer) reduceWin
 		outputFlat[outputFlatIdx] = bfloat16.FromFloat32(
 			outputFlat[outputFlatIdx].Float32() * operandFlat[operandFlatIdx].Float32())
 	}
+}
+
+// =================================================================================================================
+// ConvGeneralDilated ----------------------------------------------------------------------------------------------
+// =================================================================================================================
+
+func execConvGeneralDilated(backend *Backend, node *Node, inputs []*Buffer, inputsOwned []bool) (*Buffer, error) {
+	operand := inputs[0]
+	filter := inputs[1]
+	operandShape := operand.shape
+	filterShape := filter.shape
+	outputShape := node.shape
+	dtype := outputShape.DType
+	
+	opData := node.data.(*convGeneralDilatedNode)
+	
+	// Create output buffer
+	output := backend.getBuffer(dtype, outputShape.Size())
+	output.shape = outputShape
+	output.Zeros()
+	
+	// Get the dimensions we need for convolution
+	rank := operandShape.Rank()
+	numSpatialDims := rank - 2
+	
+	operandDims := operandShape.Dimensions
+	filterDims := filterShape.Dimensions
+	outputDims := outputShape.Dimensions
+	
+	// Extract relevant dimensions from axes configuration
+	batchSize := operandDims[opData.axes.InputBatch]
+	inputChannels := operandDims[opData.axes.InputChannel]
+	outputChannels := filterDims[opData.axes.KernelOutputChannel]
+	filterInputChannels := filterDims[opData.axes.KernelInputChannel]
+	
+	// Validate the group configurations
+	if inputChannels != filterInputChannels*opData.filterGroupCount {
+		return nil, errors.Errorf("ConvGeneralDilated: input channels %d != filter input channels %d * filterGroupCount %d", 
+			inputChannels, filterInputChannels, opData.filterGroupCount)
+	}
+	
+	channelsPerFilterGroup := inputChannels / opData.filterGroupCount
+	outputChannelsPerGroup := outputChannels / opData.filterGroupCount
+	batchesPerGroup := batchSize / opData.batchGroupCount
+	
+	// Extract spatial dimensions
+	operandSpatialDims := make([]int, numSpatialDims)
+	filterSpatialDims := make([]int, numSpatialDims)
+	outputSpatialDims := make([]int, numSpatialDims)
+	for i := 0; i < numSpatialDims; i++ {
+		operandSpatialDims[i] = operandDims[opData.axes.InputSpatial[i]]
+		filterSpatialDims[i] = filterDims[opData.axes.KernelSpatial[i]]
+		outputSpatialDims[i] = outputDims[opData.axes.OutputSpatial[i]]
+	}
+	
+	// Handle strides (default to 1 if nil)
+	effectiveStrides := opData.strides
+	if effectiveStrides == nil {
+		effectiveStrides = make([]int, numSpatialDims)
+		for i := range effectiveStrides {
+			effectiveStrides[i] = 1
+		}
+	}
+	
+	// Handle paddings (default to 0 if nil)
+	effectivePaddings := opData.paddings
+	if effectivePaddings == nil {
+		effectivePaddings = make([][2]int, numSpatialDims)
+		for i := range effectivePaddings {
+			effectivePaddings[i] = [2]int{0, 0}
+		}
+	}
+	inputDilation := opData.inputDilation
+	if inputDilation == nil {
+		inputDilation = make([]int, numSpatialDims)
+		for i := range inputDilation {
+			inputDilation[i] = 1
+		}
+	}
+	
+	filterDilation := opData.filterDilation
+	if filterDilation == nil {
+		filterDilation = make([]int, numSpatialDims)
+		for i := range filterDilation {
+			filterDilation[i] = 1
+		}
+	}
+	
+	// Calculate strides for flat array indexing
+	operandStrides := calculateStrides(operandShape.Dimensions)
+	filterStrides := calculateStrides(filterShape.Dimensions)
+	outputStrides := calculateStrides(outputShape.Dimensions)
+	
+	// Use the generic convolution function based on dtype
+	switch dtype {
+	case dtypes.Float32:
+		return convGeneralDilatedGeneric[float32](backend, operand, filter, output, opData, 
+			operandStrides, filterStrides, outputStrides, 
+			batchSize, inputChannels, outputChannels, channelsPerFilterGroup, outputChannelsPerGroup, batchesPerGroup,
+			operandSpatialDims, filterSpatialDims, outputSpatialDims, 
+			effectiveStrides, effectivePaddings, inputDilation, filterDilation, numSpatialDims)
+	case dtypes.Float64:
+		return convGeneralDilatedGeneric[float64](backend, operand, filter, output, opData, 
+			operandStrides, filterStrides, outputStrides, 
+			batchSize, inputChannels, outputChannels, channelsPerFilterGroup, outputChannelsPerGroup, batchesPerGroup,
+			operandSpatialDims, filterSpatialDims, outputSpatialDims, 
+			effectiveStrides, effectivePaddings, inputDilation, filterDilation, numSpatialDims)
+	case dtypes.BFloat16:
+		return convGeneralDilatedBFloat16(backend, operand, filter, output, opData, 
+			operandStrides, filterStrides, outputStrides, 
+			batchSize, inputChannels, outputChannels, channelsPerFilterGroup, outputChannelsPerGroup, batchesPerGroup,
+			operandSpatialDims, filterSpatialDims, outputSpatialDims, 
+			effectiveStrides, effectivePaddings, inputDilation, filterDilation, numSpatialDims)
+	default:
+		return nil, errors.Errorf("ConvGeneralDilated: unsupported dtype %s", dtype)
+	}
+}
+
+func convGeneralDilatedGeneric[T PODNumericConstraints](
+	backend *Backend, operand, filter, output *Buffer, opData *convGeneralDilatedNode,
+	operandStrides, filterStrides, outputStrides []int,
+	batchSize, inputChannels, outputChannels, channelsPerFilterGroup, outputChannelsPerGroup, batchesPerGroup int,
+	operandSpatialDims, filterSpatialDims, outputSpatialDims []int,
+	effectiveStrides []int, effectivePaddings [][2]int, inputDilation, filterDilation []int, numSpatialDims int) (*Buffer, error) {
+	
+	operandFlat := operand.flat.([]T)
+	filterFlat := filter.flat.([]T)
+	outputFlat := output.flat.([]T)
+	
+	// Main convolution loops:
+	// 1. Over batch groups
+	// 2. Over batches within each group  
+	// 3. Over filter groups
+	// 4. Over output channels within each group
+	// 5. Over output spatial positions
+	// 6. Over input channels within the filter group
+	// 7. Over filter spatial positions
+	
+	for batchGroup := 0; batchGroup < opData.batchGroupCount; batchGroup++ {
+		batchStart := batchGroup * batchesPerGroup
+		batchEnd := batchStart + batchesPerGroup
+		
+		for batch := batchStart; batch < batchEnd; batch++ {
+			for filterGroup := 0; filterGroup < opData.filterGroupCount; filterGroup++ {
+				inputChannelStart := filterGroup * channelsPerFilterGroup
+				outputChannelStart := filterGroup * outputChannelsPerGroup
+				
+				for outputChannel := 0; outputChannel < outputChannelsPerGroup; outputChannel++ {
+					actualOutputChannel := outputChannelStart + outputChannel
+					
+					// Iterate over all output spatial positions
+					outputSpatialIndices := make([]int, numSpatialDims)
+					spatialShape := shapes.Make(dtypes.Int32, outputSpatialDims...)
+					for outputSpatialIndices = range spatialShape.IterOn(outputSpatialIndices) {
+						// Calculate the output flat index
+						outputIdx := batch * outputStrides[opData.axes.OutputBatch]
+						outputIdx += actualOutputChannel * outputStrides[opData.axes.OutputChannel]
+						for i, spatialIdx := range outputSpatialIndices {
+							outputIdx += spatialIdx * outputStrides[opData.axes.OutputSpatial[i]]
+						}
+						
+						// For this output position, convolve with the filter
+						for inputChannel := 0; inputChannel < channelsPerFilterGroup; inputChannel++ {
+							actualInputChannel := inputChannelStart + inputChannel
+							
+							// Iterate over filter spatial positions
+							filterSpatialIndices := make([]int, numSpatialDims)
+							filterSpatialShape := shapes.Make(dtypes.Int32, filterSpatialDims...)
+							for filterSpatialIndices = range filterSpatialShape.IterOn(filterSpatialIndices) {
+								// Calculate input position for this filter position
+								inputSpatialIndices := make([]int, numSpatialDims)
+								validInput := true
+								
+								for i := 0; i < numSpatialDims; i++ {
+									// Calculate the input coordinate considering stride, padding, and dilation
+									inputCoord := outputSpatialIndices[i]*effectiveStrides[i] - effectivePaddings[i][0]
+									inputCoord += filterSpatialIndices[i] * filterDilation[i]
+									
+									// Check if this position is valid (within bounds and dilation alignment)
+									if inputCoord < 0 || inputCoord >= operandSpatialDims[i] {
+										validInput = false
+										break
+									}
+									
+									// Check input dilation alignment
+									if inputDilation[i] > 1 && inputCoord%inputDilation[i] != 0 {
+										validInput = false
+										break
+									}
+									
+									inputSpatialIndices[i] = inputCoord / inputDilation[i]
+									if inputSpatialIndices[i] >= operandSpatialDims[i] {
+										validInput = false
+										break
+									}
+								}
+								
+								if !validInput {
+									continue
+								}
+								
+								// Calculate input flat index
+								inputIdx := batch * operandStrides[opData.axes.InputBatch]
+								inputIdx += actualInputChannel * operandStrides[opData.axes.InputChannel]
+								for i, spatialIdx := range inputSpatialIndices {
+									inputIdx += spatialIdx * operandStrides[opData.axes.InputSpatial[i]]
+								}
+								
+								// Calculate filter flat index
+								filterIdx := actualOutputChannel * filterStrides[opData.axes.KernelOutputChannel]
+								filterIdx += inputChannel * filterStrides[opData.axes.KernelInputChannel]
+								for i, spatialIdx := range filterSpatialIndices {
+									filterIdx += spatialIdx * filterStrides[opData.axes.KernelSpatial[i]]
+								}
+								
+								// Perform the convolution operation (multiply-accumulate)
+								outputFlat[outputIdx] += operandFlat[inputIdx] * filterFlat[filterIdx]
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	return output, nil
+}
+
+func convGeneralDilatedBFloat16(
+	backend *Backend, operand, filter, output *Buffer, opData *convGeneralDilatedNode,
+	operandStrides, filterStrides, outputStrides []int,
+	batchSize, inputChannels, outputChannels, channelsPerFilterGroup, outputChannelsPerGroup, batchesPerGroup int,
+	operandSpatialDims, filterSpatialDims, outputSpatialDims []int,
+	effectiveStrides []int, effectivePaddings [][2]int, inputDilation, filterDilation []int, numSpatialDims int) (*Buffer, error) {
+	
+	operandFlat := operand.flat.([]bfloat16.BFloat16)
+	filterFlat := filter.flat.([]bfloat16.BFloat16)
+	outputFlat := output.flat.([]bfloat16.BFloat16)
+	
+	// Same structure as generic function but with BFloat16 arithmetic
+	for batchGroup := 0; batchGroup < opData.batchGroupCount; batchGroup++ {
+		batchStart := batchGroup * batchesPerGroup
+		batchEnd := batchStart + batchesPerGroup
+		
+		for batch := batchStart; batch < batchEnd; batch++ {
+			for filterGroup := 0; filterGroup < opData.filterGroupCount; filterGroup++ {
+				inputChannelStart := filterGroup * channelsPerFilterGroup
+				outputChannelStart := filterGroup * outputChannelsPerGroup
+				
+				for outputChannel := 0; outputChannel < outputChannelsPerGroup; outputChannel++ {
+					actualOutputChannel := outputChannelStart + outputChannel
+					
+					outputSpatialIndices := make([]int, numSpatialDims)
+					spatialShape := shapes.Make(dtypes.Int32, outputSpatialDims...)
+					for outputSpatialIndices = range spatialShape.IterOn(outputSpatialIndices) {
+						outputIdx := batch * outputStrides[opData.axes.OutputBatch]
+						outputIdx += actualOutputChannel * outputStrides[opData.axes.OutputChannel]
+						for i, spatialIdx := range outputSpatialIndices {
+							outputIdx += spatialIdx * outputStrides[opData.axes.OutputSpatial[i]]
+						}
+						
+						for inputChannel := 0; inputChannel < channelsPerFilterGroup; inputChannel++ {
+							actualInputChannel := inputChannelStart + inputChannel
+							
+							filterSpatialIndices := make([]int, numSpatialDims)
+							filterSpatialShape := shapes.Make(dtypes.Int32, filterSpatialDims...)
+							for filterSpatialIndices = range filterSpatialShape.IterOn(filterSpatialIndices) {
+								inputSpatialIndices := make([]int, numSpatialDims)
+								validInput := true
+								
+								for i := 0; i < numSpatialDims; i++ {
+									inputCoord := outputSpatialIndices[i]*effectiveStrides[i] - effectivePaddings[i][0]
+									inputCoord += filterSpatialIndices[i] * filterDilation[i]
+									
+									if inputCoord < 0 || inputCoord >= operandSpatialDims[i] {
+										validInput = false
+										break
+									}
+									
+									if inputDilation[i] > 1 && inputCoord%inputDilation[i] != 0 {
+										validInput = false
+										break
+									}
+									
+									inputSpatialIndices[i] = inputCoord / inputDilation[i]
+									if inputSpatialIndices[i] >= operandSpatialDims[i] {
+										validInput = false
+										break
+									}
+								}
+								
+								if !validInput {
+									continue
+								}
+								
+								inputIdx := batch * operandStrides[opData.axes.InputBatch]
+								inputIdx += actualInputChannel * operandStrides[opData.axes.InputChannel]
+								for i, spatialIdx := range inputSpatialIndices {
+									inputIdx += spatialIdx * operandStrides[opData.axes.InputSpatial[i]]
+								}
+								
+								filterIdx := actualOutputChannel * filterStrides[opData.axes.KernelOutputChannel]
+								filterIdx += inputChannel * filterStrides[opData.axes.KernelInputChannel]
+								for i, spatialIdx := range filterSpatialIndices {
+									filterIdx += spatialIdx * filterStrides[opData.axes.KernelSpatial[i]]
+								}
+								
+								// BFloat16 arithmetic
+								currentOut := outputFlat[outputIdx].Float32()
+								inputVal := operandFlat[inputIdx].Float32()
+								filterVal := filterFlat[filterIdx].Float32()
+								outputFlat[outputIdx] = bfloat16.FromFloat32(currentOut + inputVal*filterVal)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	return output, nil
 }

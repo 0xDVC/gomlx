@@ -533,6 +533,40 @@ func (b *Builder) ReduceWindow(operandOp backends.Op, reductionType backends.Red
 	return node, nil
 }
 
+type convGeneralDilatedNode struct {
+	axes                              backends.ConvolveAxesConfig
+	strides                           []int
+	paddings                          [][2]int
+	inputDilation, filterDilation     []int
+	filterGroupCount, batchGroupCount int
+}
+
+// ConvGeneralDilated implements the backends.Builder interface for generic convolution operation.
+func (b *Builder) ConvGeneralDilated(operand, filter backends.Op, axes backends.ConvolveAxesConfig, strides []int, paddings [][2]int, inputDilation, filterDilation []int, filterGroupCount, batchGroupCount int) (backends.Op, error) {
+	opType := backends.OpTypeConvGeneralDilated
+	inputs, err := b.checkOps(opType.String(), operand, filter)
+	if err != nil {
+		return nil, err
+	}
+	operandOp := inputs[0]
+	filterOp := inputs[1]
+	outputShape, err := shapeinference.ConvGeneralDilatedOp(operandOp.shape, filterOp.shape, axes, strides, paddings, inputDilation, filterDilation, filterGroupCount, batchGroupCount)
+	if err != nil {
+		return nil, err
+	}
+	node := b.newNode(opType, outputShape, operandOp, filterOp)
+	node.data = &convGeneralDilatedNode{
+		axes:             axes,
+		strides:          strides,
+		paddings:         paddings,
+		inputDilation:    inputDilation,
+		filterDilation:   filterDilation,
+		filterGroupCount: filterGroupCount,
+		batchGroupCount:  batchGroupCount,
+	}
+	return node, nil
+}
+
 //======================================================================================================================
 // Unary Operations ----------------------------------------------------------------------------------------------------
 //======================================================================================================================

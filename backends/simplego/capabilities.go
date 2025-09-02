@@ -97,8 +97,10 @@ var Capabilities = backends.Capabilities{
 		backends.OpTypeTranspose:        true,
 		backends.OpTypeWhere:            true,
 
+		// Recently implemented:
+		backends.OpTypeConvGeneralDilated: true,
+
 		// TODO: not implemented yet:
-		// backends.OpTypeConvGeneralDilated: true,
 		// backends.OpTypePad: true,
 		// backends.OpTypeReverse: true,
 		// backends.OpTypeSelectAndScatterMax: true,

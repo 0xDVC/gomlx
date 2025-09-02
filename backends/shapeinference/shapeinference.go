@@ -906,3 +906,187 @@ func ReduceWindowOp(operand shapes.Shape, windowDimensions, strides, baseDilatio
 
 	return shapes.Make(operand.DType, outputDims...), nil
 }
+
+// ConvGeneralDilatedOp returns the output shape for a ConvGeneralDilated op with the given operand and filter shapes and parameters.
+func ConvGeneralDilatedOp(operandShape, filterShape shapes.Shape, axes backends.ConvolveAxesConfig, strides []int, paddings [][2]int, inputDilation, filterDilation []int, filterGroupCount, batchGroupCount int) (shapes.Shape, error) {
+	if !operandShape.Ok() {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: invalid operand shape %s", operandShape)
+	}
+	if !filterShape.Ok() {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: invalid filter shape %s", filterShape)
+	}
+	
+	// Validate that operand and filter have the same DType
+	if operandShape.DType != filterShape.DType {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: operand dtype %s != filter dtype %s", operandShape.DType, filterShape.DType)
+	}
+
+	operandRank := operandShape.Rank()
+	filterRank := filterShape.Rank()
+	
+	// Validate that operand and filter have the same rank
+	if operandRank != filterRank {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: operand rank %d != filter rank %d", operandRank, filterRank)
+	}
+	
+	// Number of spatial dimensions is total rank minus batch and channel dimensions
+	numSpatialDims := operandRank - 2
+	if numSpatialDims < 0 {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: operand rank %d must be >= 2 to have spatial dimensions", operandRank)
+	}
+	
+	// Validate axes configuration
+	if len(axes.InputSpatial) != numSpatialDims {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: len(axes.InputSpatial)=%d, but numSpatialDims=%d", len(axes.InputSpatial), numSpatialDims)
+	}
+	if len(axes.KernelSpatial) != numSpatialDims {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: len(axes.KernelSpatial)=%d, but numSpatialDims=%d", len(axes.KernelSpatial), numSpatialDims)
+	}
+	if len(axes.OutputSpatial) != numSpatialDims {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: len(axes.OutputSpatial)=%d, but numSpatialDims=%d", len(axes.OutputSpatial), numSpatialDims)
+	}
+	
+	// Validate strides (default to 1 for each spatial dimension if nil)
+	effectiveStrides := strides
+	if effectiveStrides == nil {
+		effectiveStrides = make([]int, numSpatialDims)
+		for i := range effectiveStrides {
+			effectiveStrides[i] = 1
+		}
+	}
+	if len(effectiveStrides) != numSpatialDims {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: len(strides)=%d, but numSpatialDims=%d", len(effectiveStrides), numSpatialDims)
+	}
+	for i, stride := range effectiveStrides {
+		if stride < 1 {
+			return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: strides[%d]=%d must be >= 1", i, stride)
+		}
+	}
+	
+	// Validate paddings (default to 0 for each spatial dimension if nil)
+	effectivePaddings := paddings
+	if effectivePaddings == nil {
+		effectivePaddings = make([][2]int, numSpatialDims)
+		for i := range effectivePaddings {
+			effectivePaddings[i] = [2]int{0, 0}
+		}
+	}
+	if len(effectivePaddings) != numSpatialDims {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: len(paddings)=%d, but numSpatialDims=%d", len(effectivePaddings), numSpatialDims)
+	}
+	for i, padding := range effectivePaddings {
+		if padding[0] < 0 || padding[1] < 0 {
+			return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: paddings[%d]=[%d, %d] must be non-negative", i, padding[0], padding[1])
+		}
+	}
+	
+	// Validate inputDilation
+	if inputDilation != nil && len(inputDilation) != numSpatialDims {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: inputDilation is not nil and len(inputDilation)=%d, but numSpatialDims=%d", len(inputDilation), numSpatialDims)
+	}
+	if inputDilation != nil {
+		for i, dilation := range inputDilation {
+			if dilation < 1 {
+				return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: inputDilation[%d]=%d must be >= 1", i, dilation)
+			}
+		}
+	}
+	
+	// Validate filterDilation
+	if filterDilation != nil && len(filterDilation) != numSpatialDims {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: filterDilation is not nil and len(filterDilation)=%d, but numSpatialDims=%d", len(filterDilation), numSpatialDims)
+	}
+	if filterDilation != nil {
+		for i, dilation := range filterDilation {
+			if dilation < 1 {
+				return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: filterDilation[%d]=%d must be >= 1", i, dilation)
+			}
+		}
+	}
+	
+	// Validate group counts
+	if filterGroupCount < 1 {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: filterGroupCount=%d must be >= 1", filterGroupCount)
+	}
+	if batchGroupCount < 1 {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: batchGroupCount=%d must be >= 1", batchGroupCount)
+	}
+	
+	// Get input and filter dimensions
+	operandDims := operandShape.Dimensions
+	filterDims := filterShape.Dimensions
+	
+	// Validate batch dimension compatibility
+	batchSize := operandDims[axes.InputBatch]
+	if batchSize%batchGroupCount != 0 {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: batch size %d is not divisible by batchGroupCount %d", batchSize, batchGroupCount)
+	}
+	
+	// Validate channel dimensions compatibility
+	inputChannels := operandDims[axes.InputChannel]
+	filterInputChannels := filterDims[axes.KernelInputChannel]
+	outputChannels := filterDims[axes.KernelOutputChannel]
+	
+	if inputChannels != filterInputChannels*filterGroupCount {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: input channels %d != filter input channels %d * filterGroupCount %d", inputChannels, filterInputChannels, filterGroupCount)
+	}
+	
+	if outputChannels%filterGroupCount != 0 {
+		return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: output channels %d is not divisible by filterGroupCount %d", outputChannels, filterGroupCount)
+	}
+	
+	// Calculate output dimensions
+	outputDims := make([]int, operandRank)
+	
+	// Set batch and channel dimensions
+	outputDims[axes.OutputBatch] = batchSize
+	outputDims[axes.OutputChannel] = outputChannels
+	
+	// Calculate spatial output dimensions
+	for i := 0; i < numSpatialDims; i++ {
+		inputSpatialAxis := axes.InputSpatial[i]
+		filterSpatialAxis := axes.KernelSpatial[i]
+		outputSpatialAxis := axes.OutputSpatial[i]
+		
+		inputDim := operandDims[inputSpatialAxis]
+		filterDim := filterDims[filterSpatialAxis]
+		stride := effectiveStrides[i]
+		paddingLow := effectivePaddings[i][0]
+		paddingHigh := effectivePaddings[i][1]
+		
+		inputDil := 1
+		if inputDilation != nil {
+			inputDil = inputDilation[i]
+		}
+		
+		filterDil := 1
+		if filterDilation != nil {
+			filterDil = filterDilation[i]
+		}
+		
+		// Calculate effective input and filter dimensions after dilation
+		effectiveInputDim := (inputDim-1)*inputDil + 1
+		effectiveFilterDim := (filterDim-1)*filterDil + 1
+		
+		// Calculate padded input size
+		paddedInputDim := effectiveInputDim + paddingLow + paddingHigh
+		
+		// Validate that filter fits in padded input
+		if effectiveFilterDim > paddedInputDim {
+			return shapes.Invalid(), errors.Errorf(
+				"ConvGeneralDilatedOp: effective filter dimension %d for spatial axis %d is larger than padded input dimension %d. (input_dim: %d, input_dilation: %d, filter_dim: %d, filter_dilation: %d, padding: [%d,%d])",
+				effectiveFilterDim, i, paddedInputDim, inputDim, inputDil, filterDim, filterDil, paddingLow, paddingHigh)
+		}
+		
+		// Calculate output dimension using standard convolution formula
+		// output_dim = floor((padded_input_size - effective_filter_size) / stride) + 1
+		numerator := paddedInputDim - effectiveFilterDim
+		outputDims[outputSpatialAxis] = numerator/stride + 1
+		
+		if outputDims[outputSpatialAxis] < 1 {
+			return shapes.Invalid(), errors.Errorf("ConvGeneralDilatedOp: calculated output dimension %d for spatial axis %d is < 1", outputDims[outputSpatialAxis], i)
+		}
+	}
+	
+	return shapes.Make(operandShape.DType, outputDims...), nil
+}
